@@ -3,6 +3,7 @@ import os
 import warnings
 from typing import List, Dict, Optional
 import argparse
+import logging
 
 import faiss
 import torch
@@ -15,20 +16,32 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 def load_corpus(corpus_path: str):
+    logger.info(f"Loading corpus from {corpus_path}")
     corpus = datasets.load_dataset(
         'json', 
         data_files=corpus_path,
         split="train",
         num_proc=4
     )
+    logger.info(f"Corpus loaded with {len(corpus)} documents")
     return corpus
 
 def read_jsonl(file_path):
+    logger.info(f"Reading JSONL file from {file_path}")
     data = []
     with open(file_path, "r") as f:
         for line in f:
             data.append(json.loads(line))
+    logger.info(f"Read {len(data)} items from JSONL file")
     return data
 
 def load_docs(corpus, doc_idxs):
@@ -36,6 +49,7 @@ def load_docs(corpus, doc_idxs):
     return results
 
 def load_model(model_path: str, use_fp16: bool = False):
+    logger.info(f"Loading model from {model_path} (FP16: {use_fp16})")
     model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     model = AutoModel.from_pretrained(model_path, trust_remote_code=True)
     model.eval()
@@ -43,6 +57,7 @@ def load_model(model_path: str, use_fp16: bool = False):
     if use_fp16: 
         model = model.half()
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=True)
+    logger.info(f"Model loaded successfully")
     return model, tokenizer
 
 def pooling(
@@ -63,6 +78,7 @@ def pooling(
 
 class Encoder:
     def __init__(self, model_name, model_path, pooling_method, max_length, use_fp16):
+        logger.info(f"Initializing {model_name} encoder with {pooling_method} pooling")
         self.model_name = model_name
         self.model_path = model_path
         self.pooling_method = pooling_method
@@ -78,6 +94,8 @@ class Encoder:
         if isinstance(query_list, str):
             query_list = [query_list]
 
+        logger.debug(f"Encoding {len(query_list)} queries/passages")
+        
         if "e5" in self.model_name.lower():
             if is_query:
                 query_list = [f"query: {query}" for query in query_list]
@@ -146,12 +164,15 @@ class BaseRetriever:
 class BM25Retriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        logger.info(f"Initializing BM25 retriever with index at {self.index_path}")
         from pyserini.search.lucene import LuceneSearcher
         self.searcher = LuceneSearcher(self.index_path)
         self.contain_doc = self._check_contain_doc()
         if not self.contain_doc:
+            logger.info("Index does not contain document content, loading corpus")
             self.corpus = load_corpus(self.corpus_path)
         self.max_process_num = 8
+        logger.info("BM25 retriever initialized successfully")
     
     def _check_contain_doc(self):
         return self.searcher.doc(0).raw() is not None
@@ -159,8 +180,10 @@ class BM25Retriever(BaseRetriever):
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
+        logger.debug(f"Searching for: '{query}' with topk={num}")
         hits = self.searcher.search(query, num)
         if len(hits) < 1:
+            logger.warning(f"No results found for query: '{query}'")
             if return_score:
                 return [], []
             else:
@@ -193,6 +216,7 @@ class BM25Retriever(BaseRetriever):
             return results
 
     def _batch_search(self, query_list: List[str], num: int = None, return_score: bool = False):
+        logger.info(f"Batch searching for {len(query_list)} queries")
         results = []
         scores = []
         for query in query_list:
@@ -207,6 +231,8 @@ class BM25Retriever(BaseRetriever):
 class DenseRetriever(BaseRetriever):
     def __init__(self, config):
         super().__init__(config)
+        logger.info(f"Initializing Dense retriever with {config.retrieval_method}")
+        logger.info(f"Loading FAISS index from {self.index_path}")
         self.index = faiss.read_index(self.index_path)
         if config.faiss_gpu:
             co = faiss.GpuMultipleClonerOptions()
@@ -215,6 +241,7 @@ class DenseRetriever(BaseRetriever):
             self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
 
         self.corpus = load_corpus(self.corpus_path)
+        logger.info(f"Initializing encoder with {config.retrieval_model_path}")
         self.encoder = Encoder(
             model_name = self.retrieval_method,
             model_path = config.retrieval_model_path,
@@ -224,10 +251,12 @@ class DenseRetriever(BaseRetriever):
         )
         self.topk = config.retrieval_topk
         self.batch_size = config.retrieval_batch_size
+        logger.info("Dense retriever initialized successfully")
 
     def _search(self, query: str, num: int = None, return_score: bool = False):
         if num is None:
             num = self.topk
+        logger.debug(f"Searching for: '{query}' with topk={num}")
         query_emb = self.encoder.encode(query)
         scores, idxs = self.index.search(query_emb, k=num)
         idxs = idxs[0]
@@ -244,9 +273,11 @@ class DenseRetriever(BaseRetriever):
         if num is None:
             num = self.topk
         
+        logger.info(f"Batch searching for {len(query_list)} queries with topk={num}")
         results = []
         scores = []
         for start_idx in tqdm(range(0, len(query_list), self.batch_size), desc='Retrieval process: '):
+            logger.debug(f"Processing batch {start_idx//self.batch_size + 1}/{(len(query_list)-1)//self.batch_size + 1}")
             query_batch = query_list[start_idx:start_idx + self.batch_size]
             batch_emb = self.encoder.encode(query_batch)
             batch_scores, batch_idxs = self.index.search(batch_emb, k=num)
@@ -271,6 +302,7 @@ class DenseRetriever(BaseRetriever):
             return results
 
 def get_retriever(config):
+    logger.info(f"Creating retriever with method: {config.retrieval_method}")
     if config.retrieval_method == "bm25":
         return BM25Retriever(config)
     else:
@@ -334,6 +366,7 @@ def retrieve_endpoint(request: QueryRequest):
       "return_scores": true
     }
     """
+    logger.info(f"Received retrieval request with {len(request.queries)} queries")
     if not request.topk:
         request.topk = config.retrieval_topk  # fallback to default
 
@@ -355,6 +388,7 @@ def retrieve_endpoint(request: QueryRequest):
             resp.append(combined)
         else:
             resp.append(single_result)
+    logger.info(f"Returning {len(resp)} result sets")
     return {"result": resp}
 
 
@@ -369,6 +403,13 @@ if __name__ == "__main__":
     parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
 
     args = parser.parse_args()
+    logger.info("Starting retrieval server with arguments:")
+    logger.info(f"  Index path: {args.index_path}")
+    logger.info(f"  Corpus path: {args.corpus_path}")
+    logger.info(f"  Retriever: {args.retriever_name}")
+    logger.info(f"  Model: {args.retriever_model}")
+    logger.info(f"  Top-k: {args.topk}")
+    logger.info(f"  FAISS GPU: {args.faiss_gpu}")
     
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
@@ -386,7 +427,9 @@ if __name__ == "__main__":
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
+    logger.info("Initializing retriever...")
     retriever = get_retriever(config)
     
     # 3) Launch the server. By default, it listens on http://127.0.0.1:8000
+    logger.info("Starting FastAPI server on 0.0.0.0:8000")
     uvicorn.run(app, host="0.0.0.0", port=8000)
