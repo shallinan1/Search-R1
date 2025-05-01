@@ -401,6 +401,7 @@ if __name__ == "__main__":
     parser.add_argument("--retriever_name", type=str, default="e5", help="Name of the retriever model.")
     parser.add_argument("--retriever_model", type=str, default="intfloat/e5-base-v2", help="Path of the retriever model.")
     parser.add_argument('--faiss_gpu', action='store_true', help='Use GPU for computation')
+    parser.add_argument('--batch_size', type=int, default=512, help='Batch size for processing queries')
 
     args = parser.parse_args()
     logger.info("Starting retrieval server with arguments:")
@@ -410,6 +411,7 @@ if __name__ == "__main__":
     logger.info(f"  Model: {args.retriever_model}")
     logger.info(f"  Top-k: {args.topk}")
     logger.info(f"  FAISS GPU: {args.faiss_gpu}")
+    logger.info(f"  Batch size: {args.batch_size}")
     
     # 1) Build a config (could also parse from arguments).
     #    In real usage, you'd parse your CLI arguments or environment variables.
@@ -423,7 +425,7 @@ if __name__ == "__main__":
         retrieval_pooling_method="mean",
         retrieval_query_max_length=256,
         retrieval_use_fp16=True,
-        retrieval_batch_size=512,
+        retrieval_batch_size=args.batch_size,
     )
 
     # 2) Instantiate a global retriever so it is loaded once and reused.
