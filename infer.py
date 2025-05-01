@@ -1,20 +1,39 @@
+import os
+# Set HuggingFace cache directory
+os.environ["HF_HOME"] = "/gscratch/xlab/hallisky/cache/"
+os.environ["TRANSFORMERS_CACHE"] = "/gscratch/xlab/hallisky/cache/"
+os.environ["HF_DATASETS_CACHE"] = "/gscratch/xlab/hallisky/cache/"
+os.environ["TORCH_HOME"] = "/gscratch/xlab/hallisky/cache/"
+
 import transformers
 import torch
 import random
 from datasets import load_dataset
 import requests
+import argparse
+import sys
 
-question = "Mike Barnett negotiated many contracts including which player that went on to become general manager of CSKA Moscow of the Kontinental Hockey League?"
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Answer questions using Search-R1 model')
+parser.add_argument('--questions', nargs='+', help='List of questions to answer')
+parser.add_argument('--model_id', type=str, default="PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-7b-em-ppo", 
+                    help='Model ID to use for inference')
+parser.add_argument('--temperature', type=float, default=0.7, help='Temperature for generation')
+args = parser.parse_args()
+
+# Default question if none provided
+default_questions = [
+    "Mike Barnett negotiated many contracts including which player that went on to become general manager of CSKA Moscow of the Kontinental Hockey League?",
+    "What is the capital of France?",
+    "Who wrote the novel 'Pride and Prejudice'?"
+]
+
+questions = args.questions if args.questions else default_questions
 
 # Model ID and device setup
-model_id = "PeterJinGo/SearchR1-nq_hotpotqa_train-qwen2.5-7b-em-ppo"
+model_id = args.model_id
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-question = question.strip()
-if question[-1] != '?':
-    question += '?'
-curr_eos = [151645, 151643] # for Qwen2.5 series models
-curr_search_template = '\n\n{output_text}<information>{search_results}</information>\n\n'
 
 # Prepare the message
 prompt = f"""Answer the given question. \
@@ -26,6 +45,9 @@ If you find no further external knowledge needed, you can directly provide the a
 # Initialize the tokenizer and model
 tokenizer = transformers.AutoTokenizer.from_pretrained(model_id)
 model = transformers.AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="auto")
+
+curr_eos = [151645, 151643] # for Qwen2.5 series models
+curr_search_template = '\n\n{output_text}<information>{search_results}</information>\n\n'
 
 # Define the custom stopping criterion
 class StopOnSequence(transformers.StoppingCriteria):
@@ -83,46 +105,68 @@ def search(query: str):
 target_sequences = ["</search>", " </search>", "</search>\n", " </search>\n", "</search>\n\n", " </search>\n\n"]
 stopping_criteria = transformers.StoppingCriteriaList([StopOnSequence(target_sequences, tokenizer)])
 
-cnt = 0
-
-if tokenizer.chat_template:
-    prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
-
-print('\n\n################# [Start Reasoning + Searching] ##################\n\n')
-print(prompt)
-# Encode the chat-formatted prompt and move it to the correct device
-while True:
-    input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
-    attention_mask = torch.ones_like(input_ids)
+def answer_question(question):
+    # Prepare the question
+    question = question.strip()
+    if question[-1] != '?':
+        question += '?'
     
-    # Generate text with the stopping criteria
-    outputs = model.generate(
-        input_ids,
-        attention_mask=attention_mask,
-        max_new_tokens=1024,
-        stopping_criteria=stopping_criteria,
-        pad_token_id=tokenizer.eos_token_id,
-        do_sample=True,
-        temperature=0.7
-    )
+    # Prepare the message
+    if tokenizer.chat_template:
+        prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}], add_generation_prompt=True, tokenize=False)
 
-    if outputs[0][-1].item() in curr_eos:
+    print('\n\n################# [Start Reasoning + Searching] ##################\n\n')
+    print(f"Question: {question}")
+    print(prompt)
+    
+    cnt = 0
+    final_output = ""
+    
+    # Encode the chat-formatted prompt and move it to the correct device
+    while True:
+        input_ids = tokenizer.encode(prompt, return_tensors='pt').to(device)
+        attention_mask = torch.ones_like(input_ids)
+        
+        # Generate text with the stopping criteria
+        outputs = model.generate(
+            input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=1024,
+            stopping_criteria=stopping_criteria,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=True,
+            temperature=args.temperature
+        )
+
+        if outputs[0][-1].item() in curr_eos:
+            generated_tokens = outputs[0][input_ids.shape[1]:]
+            output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            print(output_text)
+            final_output += output_text
+            break
+
         generated_tokens = outputs[0][input_ids.shape[1]:]
         output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
-        print(output_text)
-        break
+        
+        tmp_query = get_query(tokenizer.decode(outputs[0], skip_special_tokens=True))
+        if tmp_query:
+            # print(f'searching "{tmp_query}"...')
+            search_results = search(tmp_query)
+        else:
+            search_results = ''
 
-    generated_tokens = outputs[0][input_ids.shape[1]:]
-    output_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+        search_text = curr_search_template.format(output_text=output_text, search_results=search_results)
+        prompt += search_text
+        cnt += 1
+        print(search_text)
+        final_output += search_text
     
-    tmp_query = get_query(tokenizer.decode(outputs[0], skip_special_tokens=True))
-    if tmp_query:
-        # print(f'searching "{tmp_query}"...')
-        search_results = search(tmp_query)
-    else:
-        search_results = ''
+    return final_output
 
-    search_text = curr_search_template.format(output_text=output_text, search_results=search_results)
-    prompt += search_text
-    cnt += 1
-    print(search_text)
+# Process all questions
+for i, question in enumerate(questions):
+    print(f"\n\n===== Question {i+1}/{len(questions)} =====")
+    answer = answer_question(question)
+    print(f"\n----- Answer for Question {i+1} -----")
+    print(answer)
+    print("\n" + "="*50 + "\n")
