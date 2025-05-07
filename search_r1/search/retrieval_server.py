@@ -234,11 +234,35 @@ class DenseRetriever(BaseRetriever):
         logger.info(f"Initializing Dense retriever with {config.retrieval_method}")
         logger.info(f"Loading FAISS index from {self.index_path}")
         self.index = faiss.read_index(self.index_path)
-        if config.faiss_gpu:
-            co = faiss.GpuMultipleClonerOptions()
-            co.useFloat16 = True
-            co.shard = True
-            self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+
+        # OLD code - OOM on A100 GPU - requires 8 A100 GPUs?       
+        # if config.faiss_gpu:
+        #     co = faiss.GpuMultipleClonerOptions()
+        #     co.useFloat16 = True
+        #     co.shard = True
+        #     self.index = faiss.index_cpu_to_all_gpus(self.index, co=co)
+        
+        # New code (CPU)
+        # Convert to HNSW index for approximate search if not already
+        if not isinstance(self.index, faiss.IndexHNSWFlat):
+            logger.info("Converting to HNSW index for approximate search")
+            # HNSW parameters
+            M = 64  # number of connections per layer
+            efConstruction = 40  # size of the dynamic candidate list
+            efSearch = 16  # size of the dynamic candidate list for search
+            
+            # Create HNSW index
+            self.index = faiss.IndexHNSWFlat(self.index.d, M, faiss.METRIC_INNER_PRODUCT)
+            self.index.hnsw.efConstruction = efConstruction
+            self.index.hnsw.efSearch = efSearch
+            
+            # Copy vectors to new index
+            logger.info("Copying vectors to HNSW index")
+            self.index.add(self.index)
+        
+        # No need for GPU if using HNSW
+        config.faiss_gpu = False
+        logger.info("Using CPU-based HNSW index for approximate search")
 
         self.corpus = load_corpus(self.corpus_path)
         logger.info(f"Initializing encoder with {config.retrieval_model_path}")
